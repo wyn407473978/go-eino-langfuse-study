@@ -228,6 +228,7 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 		}
 		userMessage := schema.UserMessage(chatReq.Message)
 		messages = append(messages, userMessage)
+		startAt := time.Now()
 		stream, err := chatModel.Stream(streamTraceContext, messages)
 		if err != nil {
 			log.Printf("模型流创建失败: %v", err)
@@ -253,6 +254,8 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 		c.SSEvent("meta", gin.H{"trace_id": traceID})
 		c.Writer.Flush()
 
+		var firstOutTime time.Time
+
 		for {
 			recv, err := stream.Recv()
 			if errors.Is(err, io.EOF) {
@@ -271,6 +274,9 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 				c.Writer.Flush()
 				return
 			}
+			if recv.Content != "" && firstOutTime.IsZero() {
+				firstOutTime = time.Now()
+			}
 			c.SSEvent("chunk", gin.H{
 				"content": recv.Content,
 			})
@@ -278,6 +284,14 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 			fullMessages = append(fullMessages, recv)
 			c.Writer.Flush()
 		}
+		finishAt := time.Now()
+		if firstOutTime.IsZero() {
+			fmt.Println("未收到有效正文")
+		} else {
+			fmt.Println("首正文到达耗时：", firstOutTime.Sub(startAt))
+		}
+		fmt.Println("流式总耗时：", finishAt.Sub(startAt))
+
 		if c.Request.Context().Err() != nil {
 			return
 		}
@@ -287,6 +301,18 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 			return
 		}
 		concatMessages, err := schema.ConcatMessages(fullMessages)
+		if concatMessages.ResponseMeta == nil ||
+			concatMessages.ResponseMeta.Usage == nil {
+			log.Println("本次未返回 usage")
+		} else {
+			usage := concatMessages.ResponseMeta.Usage
+			log.Printf(
+				"输入 token：%d，输出 token：%d，总 token：%d",
+				usage.PromptTokens,
+				usage.CompletionTokens,
+				usage.TotalTokens,
+			)
+		}
 		if err != nil {
 			log.Println("消息聚合失败")
 			c.SSEvent("error", gin.H{"message": "消息聚合失败"})
