@@ -10,6 +10,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"go-langfuse-demo/internal/memory"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"log"
 	"net/http"
@@ -172,10 +173,26 @@ func ModelChat(ctx context.Context, chatModel *openai.ChatModel, chatReq req.Mod
 	tracer := parentSpan.TracerProvider().Tracer("go-langfuse-demo/memory")
 
 	_, historySpan := tracer.Start(ctx, "load-chat-history")
+	traceSessionID := url.QueryEscape(userID) + ":" + url.QueryEscape(sessionID)
+
+	historySpan.SetAttributes(
+		attribute.String("langfuse.user.id", userID),
+		attribute.String("langfuse.session.id", traceSessionID),
+		attribute.StringSlice("langfuse.trace.tags", []string{"chat", "memory"}),
+		attribute.String("langfuse.trace.metadata.feature", "chat"),
+		attribute.String("langfuse.trace.metadata.channel", "api"),
+		attribute.String("langfuse.release", "lesson-d08"),
+		attribute.String("langfuse.environment", "development"),
+	)
 	history := store.Load(userID, sessionID)
 	marshal, err := json.Marshal(history)
+	historySpan.SetAttributes(attribute.String("langfuse.observation.type", "span"))
 	if err == nil {
-		historySpan.SetAttributes(attribute.String("langfuse.observation.type", "span"), attribute.String("chat-history", string(marshal)), attribute.String("langfuse.observation.output", string(marshal)))
+		historySpan.SetAttributes(attribute.String("chat-history", string(marshal)), attribute.String("langfuse.observation.output", string(marshal)))
+	} else {
+		historySpan.RecordError(err)
+		historySpan.SetStatus(codes.Error, "历史消息序列化失败")
+		log.Printf("历史消息序列化失败: %v", err)
 	}
 	historySpan.End()
 
