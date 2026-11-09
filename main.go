@@ -32,6 +32,30 @@ const chatTimeout = 60 * time.Second
 func main() {
 	engine := gin.Default()
 
+	engine.GET("/sse", func(c *gin.Context) {
+		c.Header("Content-type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		datas := []string{"第一块", "第二块", "第三块"}
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for _, value := range datas {
+			select {
+			case <-ticker.C:
+				c.SSEvent("chunk", gin.H{"content": value})
+				c.Writer.Flush()
+			case <-c.Request.Context().Done():
+				log.Println("SSE 客户端已断开，停止发送")
+
+				return
+
+			}
+		}
+		c.SSEvent("done", gin.H{"finished": true})
+		c.Writer.Flush()
+
+	})
+
 	server := http.Server{
 		Addr:    ":8080",
 		Handler: engine,
