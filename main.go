@@ -190,7 +190,24 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 		ctx := c.Request.Context()
 		timeoutCtx, cancelFunc := context.WithTimeout(ctx, timeout)
 		defer cancelFunc()
-		session, err := store.LockSession(timeoutCtx, chatReq.UserID, chatReq.SessionID)
+		traceSessionID := url.QueryEscape(chatReq.UserID) + ":" + url.QueryEscape(chatReq.SessionID)
+		streamTraceContext := langfuseHandler.StartTrace(timeoutCtx, langfuse.WithName("chat-stream"),
+			langfuse.WithInput(chatReq.Message),
+			langfuse.WithUserID(chatReq.UserID),
+			langfuse.WithSessionID(traceSessionID),
+			langfuse.WithTags("chat", "memory", "stream"),
+			langfuse.WithMetadata(map[string]string{
+				"feature": "chat",
+				"channel": "sse",
+			}),
+			langfuse.WithRelease("lesson-d12"))
+		traceOutput := "请求未完成"
+
+		defer func() {
+			langfuseHandler.EndTrace(streamTraceContext, traceOutput)
+		}()
+		traceID := trace.SpanFromContext(streamTraceContext).SpanContext().TraceID().String()
+		session, err := store.LockSession(streamTraceContext, chatReq.UserID, chatReq.SessionID)
 		if err != nil {
 			log.Printf("获取会话锁失败: %v", err)
 
@@ -211,7 +228,7 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 		}
 		userMessage := schema.UserMessage(chatReq.Message)
 		messages = append(messages, userMessage)
-		stream, err := chatModel.Stream(timeoutCtx, messages)
+		stream, err := chatModel.Stream(streamTraceContext, messages)
 		if err != nil {
 			log.Printf("模型流创建失败: %v", err)
 			if errors.Is(err, context.DeadlineExceeded) ||
@@ -227,9 +244,14 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 		// 在这里实现
 		c.Header("Content-type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
+		c.Header("X-Trace-ID", traceID)
+		log.Printf("流式请求 trace_id=%s", traceID)
+
 		c.Writer.Flush()
 
 		var fullMessages []*schema.Message
+		c.SSEvent("meta", gin.H{"trace_id": traceID})
+		c.Writer.Flush()
 
 		for {
 			recv, err := stream.Recv()
@@ -272,6 +294,7 @@ func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse
 			return
 		}
 		store.AppendTurn(chatReq.UserID, chatReq.SessionID, userMessage, concatMessages)
+		traceOutput = concatMessages.Content
 
 		c.SSEvent("done", gin.H{"finished": true})
 		c.Writer.Flush()
