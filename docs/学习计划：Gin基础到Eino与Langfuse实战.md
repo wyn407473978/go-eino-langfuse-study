@@ -2,6 +2,8 @@
 
 制定日期：2026-11-07。
 
+**学习已于 2026-11-08 按你的要求暂停。**下次优先阅读 [学习进度与恢复入口](./学习进度与恢复入口.md)，按最新断点继续。
+
 依据：[Langfuse 精通路线：在 go-eino Demo 中逐步接入](./Langfuse%20精通路线：在%20go-eino%20Demo%20中逐步接入.md)。
 
 你的起点：能使用 Gin 开发简单后台管理系统，对 Eino 不熟练。当前项目只有 Go 模块和 Hello World，尚未接入模型或 Langfuse。
@@ -18,13 +20,32 @@
 - D03 多轮消息：已只读审查两轮调用与 assistant 历史拼接；你反馈已完成携带历史和不携带历史的对照。下一项练习为请求超时与错误区分；继续会话时需将第二轮 user 与 assistant 消息都保存回历史。
 - 你明确表示已熟练掌握超时与错误处理，跳过 D03 的该项练习，直接进入 D04；此项按自述掌握记录，不标记为已运行验收。D04 继续检查请求 context 的正确传递。
 - D04 最新进度：你于 2026-11-08 明确授权本次由我修改。我修复了参数与空白校验、400/502/504 错误响应、超时与 system 消息，提取可独立验证的 handler，并添加离线回归测试；本地 go test 已通过，覆盖成功、非法请求、模型失败、超时、取消传播、单一 JSON 响应和消息隔离。真实 DeepSeek HTTP 接口联调仍由你确认；本次授权不改变后续由你写代码的默认配合方式。
+- D05 已开始：拆成内存存储、接入聊天、并发与周验收三个小任务。当前先由你实现 internal/memory/store.go：按 user_id 与 session_id 的组合隔离，存储完整 user/assistant 消息对，读取返回切片副本，保留最近 10 轮；接入时再处理同会话整轮请求串行，避免把存储锁误认为整轮会话锁。
+- D05 存储静态审查已通过（实际文件 internal/memory/momory.go）：联合 key、互斥访问、正确长度的切片复制、非空消息成对追加、追加后保留最近 20 条均正确。尚未由我运行存储行为测试；下一小任务是将存储接入聊天过程，再单独处理同会话整轮并发。
+- D05 存储测试已完成：文件已由你更名为 internal/memory/memory.go。根据你明确提出的测试编写请求，我补全 internal/memory/memory_test.go，并加入中文学习注释；7 组测试覆盖单轮读写、空会话、用户/会话隔离、切片副本、历史上限、nil 输入和并发读写。go test -race -v -timeout 60s ./internal/memory 已通过，执行路径无数据竞争报告；这不等于完成整轮模型请求的并发顺序控制。下一步仍由你接入聊天逻辑。
+- D05 聊天接入已完成：你反馈真实接口多轮记忆已可用，前端字段采用 message、userId、sessionId。按你授权已同步 main_test.go 的回调和业务函数签名，验证请求ID传递、system/历史/本次问题顺序、会话隔离、完整assistant消息的usage保留，以及认证失败/超时/取消时历史不变；全项目 go test -race -timeout 60s ./... 已通过。
+- D05 下一任务：由你实现按联合 SessionKey 的整轮会话锁，覆盖 Load → Generate → AppendTurn。拟使用容量为1的channel配合context取消，Store的全局mutex仅用于查找或创建锁；同会话互斥，不同会话允许并发，等待超时不进入模型调用。
+- D05 已完成：你已实现 LockSession 并修复全局锁范围、获取前后context检查、令牌归还和store判空顺序。已补 internal/memory/session_lock_test.go、session_chat_test.go，验证同会话等待、等待期间历史仍可读写、其他联合key不受阻塞、取消/超时后可再次获取、完整两轮消息顺序、等待超时不调用模型及失败后会话恢复。全项目 go test -race -timeout 60s ./... 已通过。下一项为 D06：第一条 Langfuse 追踪。
+- D06 已开始：按原计划先由你新建 cmd/trace/main.go，完成一次命令行模型调用的追踪。已核对 callbacks/langfuse/v2 最新标签为 v2.0.2；使用 NewHandler、全局回调注册、StartTrace 返回的 context、EndTrace 和退出时独立context下的 Shutdown。先验证根span与generation的输入输出、模型和usage，再在D07接入HTTP及服务关闭流程。尚未安装依赖、编写程序或生成实际追踪。
+- D06 最新进度：你选择直接在现有HTTP入口接入，已安装v2.0.2并完成初始化、回调注册和trace context传递；你明确反馈Langfuse中已看到正常调用的输入输出。按实际实现继续D07 HTTP生命周期，不再将CLI入口作为当前必做项。仍需确认generation的模型/usage，并修复失败分支提前return而跳过EndTrace的问题。
+- D07 当前任务：由你用 http.Server、signal.NotifyContext 和启动错误channel管理服务；退出时先完成HTTP Shutdown，再在main返回时执行Langfuse的有界关闭。HTTP关闭预算参考当前60秒请求超时设为65秒，Langfuse单独10秒，关闭context从Background创建。
+- D07 代码及现有回归测试已通过：路由初始化后启动HTTP，select后统一创建独立65秒context并关闭HTTP，main返回时用独立10秒context关闭Langfuse；成功和失败均调用EndTrace，日志使用%v且业务错误保留%w。全项目 go test -race -timeout 60s ./... 已通过。现有测试不覆盖真实进程信号和Langfuse服务端导出，仍需你验证请求进行中Ctrl+C、请求完成、程序退出及最后一条追踪可见。
+- D07 实际停机验收已通过：你明确反馈验证完成且无问题。进入D08，由你添加User、Session、Tags、Metadata与Release属性，并在根节点和generation验证传播。Langfuse按sessionId聚合，需将现有业务联合用户/会话标识编码成项目内唯一的追踪sessionId，避免不同用户相同sessionId在平台上混合；拟用URL转义后的两段ID以冒号连接。
+- D08 当前拆分为先验证User与Session：你已在StartTrace中添加WithUserID和WithSessionID，其他分类属性后续再补。当前直接使用请求SessionID；如果它只在用户范围内唯一，需组合用户ID形成追踪SessionID。属性实际传播与会话分组仍待验证。
+- D08 最新进度：你反馈修正后验证无问题；已检查代码，追踪SessionID使用URL转义后的用户/会话组合，且Tags、Metadata和Release也已添加，方法用法正确。其余属性的UI筛选及子节点传播在后续手动span验收时一起核对。
+- D09 已开始：由你给读取历史增加load-chat-history手动span。本次复用当前根span的TracerProvider来共享现有导出链路，不另建导出器；在Load前开始、读取及设置属性后立即结束，使其与generation成为兄弟节点。手动OTel span的用户、会话等属性需显式设置，不能假定Eino回调会替它传播。
+- D09 当前进度：手动span的Provider、父子关系和End位置正确，json.Marshal的成功判断已修正；现有全项目竞态测试通过，但尚无手动span属性断言。当前完整历史仍在普通chat-history属性，observation.output仍为整数；若要在Output查看历史应改为String类型的JSON输出。手动节点用户/会话/标签等共享属性及UI验收仍未完成，不标记D09全部通过。
+- 你要求继续下一步，D10先进行与上述修正可独立推进的两组认证故障对照：临时错误DeepSeek Key观察业务失败但追踪可上报；恢复后临时错误Langfuse Secret观察业务成功但导出失败。每次只改变一个配置，并记录HTTP状态、日志与实际追踪，不把指导中的预期当成已验证结果。
+- D10 最新进度：你反馈认证故障对照已测试完成，未提供具体状态码与日志，因此记录为用户确认完成，不补写未见到的实测结果。D09的output现已改为JSON字符串，共享属性的手动传播仍待收尾。下一项由你临时将ModelChat的traceContex参数改成原始请求ctx，观察根节点与generation拆分、手动历史span缺失等现象，随后恢复并核对完整树。
+- D10 context对照已由你确认观察到链路不完整；当前main仍保留ModelChat(ctx, ...)的实验调用，需由你恢复traceContex。最后一项导出对照拟由你在独立cmd/export-lab入口完成：只创建一个测试trace，BatchTimeout设30秒、MaxExportBatchSize设128，以是否调用有界Shutdown区分等待导出和直接退出两个模式；尚未编写或执行此实验。
+- 2026-11-08 暂停断点：你明确要求先学到这里并记录，已创建专门恢复文档。本次只记录，不再推进实现或测试。最新main.go的调用参数写为traceConteanting，与定义traceContex不一致，留待下次先修正；D10导出实验未开始，D09手动共享属性仍待收尾。
 - 配置偏好：模型名称与基础地址直接保留在代码配置中，不要求放入系统环境变量；API Key 继续读取 DS_API_KEY。后续配置外置如有需求再选择文件或其他方式，不默认要求系统环境变量。
 
 本计划的完成目标是：你能够独立搭建、观察、评估和排查一个小型 AI 应用，并解释主要设计取舍。完成计划不等于已经具备所有生产运维经验。
 
 ## 1. 我们怎样配合
 
-- 全部程序代码、测试代码、配置文件和部署脚本由你亲手写。
+- 默认业务程序代码、配置文件和部署脚本由你亲手写；测试按你的明确授权由我协助编写并讲解，个别业务修改仅按当次明确授权执行。
 - 我负责讲解概念、推荐对应文档、拆解任务、提供分级提示，以及只读审查你的实现。
 - 每次编码任务必须明确给出所需依赖、安装命令与版本、导入路径、关键配置字段、方法签名和调用顺序，不能只要求你自行查文档。方法签名和局部用法可以用于讲解，完整实现仍由你完成。
 - 默认不提供可直接复制的完整函数、完整文件或完整工程；也不替你安装依赖、执行部署或修复代码。
@@ -486,8 +507,8 @@ Java 调用链仅在你有相应需求或基础时追加，不假设你已经熟
 
 | 周次 | 状态 | 关键证据或待解决问题 |
 | --- | --- | --- |
-| 第 1 周 | 进行中：D04 修复及离线测试通过，待你确认真实 HTTP 调用 | 本次授权由我修改；模型名和地址保留在代码配置中；测试不调用付费模型 |
-| 第 2 周 | 未开始 | |
+| 第 1 周 | D05 实现及自动验证完成 | 真实记忆功能由你确认；会话隔离、10轮限制、可取消的整轮锁及全项目竞态测试通过 |
+| 第 2 周 | 已暂停：D10 context故障已观察，导出实验未开始 | 最新断点见恢复文档；先核对context变量拼写；D09共享属性与UI验收待收尾 |
 | 第 3 周 | 未开始 | |
 | 第 4 周 | 未开始 | |
 | 第 5 周 | 未开始 | |

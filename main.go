@@ -2,18 +2,27 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cloudwego/eino-ext/callbacks/langfuse/v2"
+	"github.com/cloudwego/eino/callbacks"
+	"github.com/cloudwego/eino/schema"
+	"go-langfuse-demo/internal/memory"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"go-langfuse-demo/model/req"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
-	"github.com/cloudwego/eino/schema"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,7 +30,17 @@ const chatTimeout = 60 * time.Second
 
 func main() {
 	engine := gin.Default()
-	ctx := context.Background()
+
+	server := http.Server{
+		Addr:    ":8080",
+		Handler: engine,
+	}
+
+	serverErrors := make(chan error, 1)
+
+	notifyContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx := notifyContext
 	apiKey := os.Getenv("DS_API_KEY")
 	if apiKey == "" {
 		fmt.Println("DS_API_KEY env var not set")
@@ -33,21 +52,73 @@ func main() {
 		APIKey:  apiKey,
 	})
 	if err != nil {
-		fmt.Println(err)
-		return
+		panic(err)
 	}
 
-	engine.POST("/chat", newChatHandler(func(ctx context.Context, message string) (string, error) {
-		return ModelChat(ctx, chatModel, message)
-	}, chatTimeout))
+	//LangFuse
+	config := langfuse.Config{
+		Host:        os.Getenv("LANGFUSE_BASE_URL"),
+		PublicKey:   os.Getenv("LANGFUSE_PUBLIC_KEY"),
+		SecretKey:   os.Getenv("LANGFUSE_SECRET_KEY"),
+		ServiceName: "go-langfuse-demo",
+		Environment: "development",
+	}
+	handler, err := langfuse.NewHandler(ctx, &config)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		shoutDownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err = handler.Shutdown(shoutDownCtx)
+		if err != nil {
+			log.Printf("Langfuse 关闭失败: %v", err)
+		}
+	}()
+	callbacks.AppendGlobalHandlers(handler)
+	store := memory.NewStore()
 
-	if err := engine.Run(); err != nil {
-		fmt.Println(err)
+	engine.POST("/chat", newChatHandler(func(ctx context.Context, chatReq req.ModelChatReq) (string, error) {
+		traceSessionID := url.QueryEscape(chatReq.UserID) + ":" + url.QueryEscape(chatReq.SessionID)
+		traceContex := handler.StartTrace(ctx,
+			langfuse.WithName("chat-response"),
+			langfuse.WithInput(chatReq.Message),
+			langfuse.WithUserID(chatReq.UserID),
+			langfuse.WithSessionID(traceSessionID), langfuse.WithTags("chat", "memory"), langfuse.WithMetadata(map[string]string{"feature": "chat", "channel": "api"}), langfuse.WithRelease("lesson-d08"),
+		)
+		chat, err := ModelChat(traceContex, chatModel, chatReq, store)
+		if err != nil {
+			handler.EndTrace(traceContex, "模型调用失败")
+			return "模型调用失败", err
+		}
+		defer handler.EndTrace(traceContex, chat)
+		return chat, err
+	}, chatTimeout))
+	go func() {
+		err := server.ListenAndServe()
+		serverErrors <- err
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP 服务运行失败：%v", err)
+		}
+
+	case <-notifyContext.Done():
+		log.Println("收到退出信号开始关闭服务")
+
+	}
+	timeout, cancelFunc := context.WithTimeout(context.Background(), time.Second*65)
+	defer cancelFunc()
+
+	if err := server.Shutdown(timeout); err != nil {
+		log.Printf("HTTP 优雅关闭失败:%v", err)
 	}
 }
 
 // 传入聊天函数和超时时间，便于独立验证 HTTP 行为。
-func newChatHandler(chat func(context.Context, string) (string, error), timeout time.Duration) gin.HandlerFunc {
+func newChatHandler(chat func(context.Context, req.ModelChatReq) (string, error), timeout time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var chatReq req.ModelChatReq
 		if err := c.ShouldBindJSON(&chatReq); err != nil {
@@ -63,7 +134,7 @@ func newChatHandler(chat func(context.Context, string) (string, error), timeout 
 		requestCtx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 		defer cancel()
 
-		answer, err := chat(requestCtx, chatReq.Message)
+		answer, err := chat(requestCtx, chatReq)
 		if err != nil {
 			log.Printf("模型调用失败: %v", err)
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
@@ -77,20 +148,44 @@ func newChatHandler(chat func(context.Context, string) (string, error), timeout 
 	}
 }
 
-func ModelChat(ctx context.Context, chatModel *openai.ChatModel, userInput string) (string, error) {
+func ModelChat(ctx context.Context, chatModel *openai.ChatModel, chatReq req.ModelChatReq, store *memory.Store) (string, error) {
+
 	if chatModel == nil {
 		return "", errors.New("chatModel is nil")
 	}
-	if strings.TrimSpace(userInput) == "" {
+	if strings.TrimSpace(chatReq.Message) == "" {
 		return "", errors.New("userInput is empty")
 	}
-	messages := []*schema.Message{
-		schema.SystemMessage("你是一个AI助手"),
-		schema.UserMessage(userInput),
+	if store == nil {
+		return "", errors.New("store is nil")
 	}
+	userID := chatReq.UserID
+	sessionID := chatReq.SessionID
+	session, err := store.LockSession(ctx, userID, sessionID)
+	if err != nil {
+		return "", err
+	}
+	defer session()
+
+	systemMessage := []*schema.Message{schema.SystemMessage("你是一个AI助手")}
+	parentSpan := trace.SpanFromContext(ctx)
+	tracer := parentSpan.TracerProvider().Tracer("go-langfuse-demo/memory")
+
+	_, historySpan := tracer.Start(ctx, "load-chat-history")
+	history := store.Load(userID, sessionID)
+	marshal, err := json.Marshal(history)
+	if err == nil {
+		historySpan.SetAttributes(attribute.String("langfuse.observation.type", "span"), attribute.String("chat-history", string(marshal)), attribute.String("langfuse.observation.output", string(marshal)))
+	}
+	historySpan.End()
+
+	messages := append(systemMessage, history...)
+	newMessage := schema.UserMessage(chatReq.Message)
+	messages = append(messages, newMessage)
 	msg, err := chatModel.Generate(ctx, messages)
 	if err != nil {
 		return "", fmt.Errorf("模型调用失败: %w", err)
 	}
+	store.AppendTurn(userID, sessionID, newMessage, msg)
 	return msg.Content, nil
 }
