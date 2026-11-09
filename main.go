@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -102,6 +103,7 @@ func main() {
 	}()
 	callbacks.AppendGlobalHandlers(handler)
 	store := memory.NewStore()
+	engine.POST("/chat/stream", newStreamChatHandler(chatModel, handler, store, chatTimeout))
 
 	engine.POST("/chat", newChatHandler(func(ctx context.Context, chatReq req.ModelChatReq) (string, error) {
 		traceSessionID := url.QueryEscape(chatReq.UserID) + ":" + url.QueryEscape(chatReq.SessionID)
@@ -170,6 +172,109 @@ func newChatHandler(chat func(context.Context, req.ModelChatReq) (string, error)
 			return
 		}
 		c.JSON(http.StatusOK, req.ModelChatResp{Answer: answer})
+	}
+}
+
+func newStreamChatHandler(chatModel *openai.ChatModel, langfuseHandler *langfuse.CallbackHandler, store *memory.Store, timeout time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var chatReq req.ModelChatReq
+		if err := c.ShouldBindJSON(&chatReq); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误或缺少必填字段"})
+			return
+		}
+		chatReq.Message = strings.TrimSpace(chatReq.Message)
+		if chatReq.Message == "" || strings.TrimSpace(chatReq.UserID) == "" || strings.TrimSpace(chatReq.SessionID) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "message、user_id 和 session_id 不能为空白"})
+			return
+		}
+		ctx := c.Request.Context()
+		timeoutCtx, cancelFunc := context.WithTimeout(ctx, timeout)
+		defer cancelFunc()
+		session, err := store.LockSession(timeoutCtx, chatReq.UserID, chatReq.SessionID)
+		if err != nil {
+			log.Printf("获取会话锁失败: %v", err)
+
+			if c.Request.Context().Err() != nil {
+				return
+			}
+
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "等待会话锁超时"})
+			return
+		}
+		defer session()
+		var messages = []*schema.Message{}
+
+		messages = append(messages, schema.SystemMessage("你是一个AI助手"))
+		if store != nil {
+			load := store.Load(chatReq.UserID, chatReq.SessionID)
+			messages = append(messages, load...)
+		}
+		userMessage := schema.UserMessage(chatReq.Message)
+		messages = append(messages, userMessage)
+		stream, err := chatModel.Stream(timeoutCtx, messages)
+		if err != nil {
+			log.Printf("模型流创建失败: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
+				c.JSON(http.StatusGatewayTimeout, gin.H{"error": "模型调用超时"})
+			} else {
+				c.JSON(http.StatusBadGateway, gin.H{"error": "模型调用失败"})
+			}
+			return
+		}
+		defer stream.Close()
+
+		// 在这里实现
+		c.Header("Content-type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Writer.Flush()
+
+		var fullMessages []*schema.Message
+
+		for {
+			recv, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				fmt.Println("stream 响应结束")
+				break
+			}
+			if err != nil {
+				log.Printf("模型流读取结束: %v", err)
+
+				if c.Request.Context().Err() != nil {
+					log.Println("客户端已断开，停止模型流读取")
+					return
+				}
+
+				c.SSEvent("error", gin.H{"message": "模型流式读取失败"})
+				c.Writer.Flush()
+				return
+			}
+			c.SSEvent("chunk", gin.H{
+				"content": recv.Content,
+			})
+
+			fullMessages = append(fullMessages, recv)
+			c.Writer.Flush()
+		}
+		if c.Request.Context().Err() != nil {
+			return
+		}
+		if timeoutCtx.Err() != nil {
+			c.SSEvent("error", gin.H{"message": "模型流式请求已取消或超时"})
+			c.Writer.Flush()
+			return
+		}
+		concatMessages, err := schema.ConcatMessages(fullMessages)
+		if err != nil {
+			log.Println("消息聚合失败")
+			c.SSEvent("error", gin.H{"message": "消息聚合失败"})
+			c.Writer.Flush()
+			return
+		}
+		store.AppendTurn(chatReq.UserID, chatReq.SessionID, userMessage, concatMessages)
+
+		c.SSEvent("done", gin.H{"finished": true})
+		c.Writer.Flush()
 	}
 }
 
