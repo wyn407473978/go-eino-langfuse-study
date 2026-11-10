@@ -3,31 +3,57 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/cloudwego/eino-ext/callbacks/langfuse/v2"
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 	"go-langfuse-demo/internal/tools"
+	"go.opentelemetry.io/otel/trace"
 	"log"
 	"os"
 	"time"
 )
 
 func main() {
+	langfuseConfig := langfuse.Config{
+		Host:                       os.Getenv("LANGFUSE_BASE_URL"),
+		PublicKey:                  os.Getenv("LANGFUSE_PUBLIC_KEY"),
+		SecretKey:                  os.Getenv("LANGFUSE_SECRET_KEY"),
+		Environment:                "development",
+		ServiceName:                "go-langfuse-agent",
+		CollapseAgentInternalSpans: true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	langfuseHandler, err := langfuse.NewHandler(ctx, &langfuseConfig)
+	if err != nil {
+		log.Printf("Langfuse 初始化失败: %v", err)
+		return
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(), 10*time.Second,
+		)
+		defer shutdownCancel()
+
+		if err := langfuseHandler.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Langfuse 关闭失败: %v", err)
+		}
+	}()
 	fmt.Println("agent")
 	progressTool, err := tools.NewProgressTool()
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("progressTool初始化失败：%v", err)
 		return
 	}
 	activitiesTool, err := tools.NewActivitiesTool()
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("活动工具初始化失败：%v", err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		Model:   "deepseek-flash",
 		APIKey:  os.Getenv("DS_API_KEY"),
@@ -35,8 +61,7 @@ func main() {
 		Timeout: 60 * time.Second,
 	})
 	if err != nil {
-		log.Println("模型创建失败")
-		log.Fatal(err)
+		log.Printf("模型创建失败:%v", err)
 		return
 	}
 
@@ -64,15 +89,31 @@ func main() {
 		return
 	}
 
+	question := "有没有 Go 相关活动？"
+
+	traceCtx := langfuseHandler.StartTrace(ctx,
+		langfuse.WithName("agent-demo"),
+		langfuse.WithInput(question),
+		langfuse.WithTags("agent", "lesson-d15"),
+	)
+
+	traceOutput := "Agent 未完成"
+	defer func() {
+		langfuseHandler.EndTrace(traceCtx, traceOutput)
+	}()
+	log.Printf("trace_id=%s",
+		trace.SpanFromContext(traceCtx).SpanContext().TraceID().String())
+
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
 		Agent:           agent,
 		EnableStreaming: false,
 	})
 
-	iter := runner.Run(ctx, []*schema.Message{
-		schema.UserMessage("有没有 Go 相关活动？"),
-	})
+	iter := runner.Run(traceCtx, []*schema.Message{
+		schema.UserMessage(question),
+	}, adk.WithCallbacks(langfuseHandler))
 
+	finalAnswer := ""
 	for {
 		event, ok := iter.Next()
 		if !ok {
@@ -95,9 +136,22 @@ func main() {
 		if msg == nil {
 			continue
 		}
+		if msg.Role == schema.Assistant && len(msg.ToolCalls) == 0 {
+			finalAnswer = msg.Content
+		}
 
 		fmt.Printf("角色：%s，工具：%s\n", msg.Role, output.ToolName)
 		fmt.Printf("正文：%s\n工具调用：%+v\n", msg.Content, msg.ToolCalls)
 	}
+	if err := ctx.Err(); err != nil {
+		log.Printf("Agent 请求未完成: %v", err)
+		return
+	}
+	if finalAnswer == "" {
+		log.Println("Agent 未返回最终正文")
+		return
+	}
+
+	traceOutput = finalAnswer
 
 }
