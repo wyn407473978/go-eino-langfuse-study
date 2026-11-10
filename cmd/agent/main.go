@@ -9,10 +9,12 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"go-langfuse-demo/internal/langfuseclient"
 	"go-langfuse-demo/internal/tools"
 	"go.opentelemetry.io/otel/trace"
 	"log"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -54,6 +56,15 @@ func main() {
 		return
 	}
 
+	managedPrompt, compiledinstruction, err := initPrompt(ctx)
+	if err != nil {
+		log.Printf("准备 Prompt 失败: %v", err)
+		return
+	}
+
+	log.Printf("本次使用 Prompt：%s，版本：%d",
+		managedPrompt.Name, managedPrompt.Version)
+
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		Model:   "deepseek-flash",
 		APIKey:  os.Getenv("DS_API_KEY"),
@@ -70,12 +81,9 @@ func main() {
 	//- 缺少必要参数时询问用户。
 	//- 未找到时如实说明，闲聊直接回答。
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "service_assistant",
-		Description: "提供办事进度查询的助手",
-		Instruction: "你是办事助手。查询办理进度时使用 query_progress；" +
-			"活动查询使用 query_activities。" +
-			"缺少编号时先询问用户；未找到时如实说明；" +
-			"普通闲聊直接回答，不编造办理状态。",
+		Name:          "service_assistant",
+		Description:   "提供办事进度查询的助手",
+		Instruction:   compiledinstruction,
 		Model:         chatModel,
 		MaxIterations: 5,
 		ToolsConfig: adk.ToolsConfig{
@@ -153,5 +161,38 @@ func main() {
 	}
 
 	traceOutput = finalAnswer
+
+}
+
+func initPrompt(parentCtx context.Context) (
+	*langfuseclient.TextPrompt,
+	string,
+	error,
+) {
+	client, err := langfuseclient.NewClient(os.Getenv("LANGFUSE_BASE_URL"), os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY"))
+	if err != nil {
+		return nil, "", fmt.Errorf("langfuse客户端初始化失败: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+	defer cancel()
+
+	prompt, err := client.GetTextPrompt(
+		ctx, "service-assistant", "production",
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("提示词获取失败：%w", err)
+	}
+	standardPrompt, err := langfuseclient.CompileText(prompt.Prompt, map[string]string{
+		"service_name": "政务服务中心",
+	})
+	if err != nil {
+		return prompt, "", fmt.Errorf("提示词编译失败：%w", err)
+	}
+	if strings.TrimSpace(standardPrompt) == "" {
+		return prompt, "", fmt.Errorf("提示词不能为空,%w", err)
+	}
+	fmt.Println(standardPrompt)
+
+	return prompt, standardPrompt, nil
 
 }
