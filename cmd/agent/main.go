@@ -6,6 +6,7 @@ import (
 	"github.com/cloudwego/eino-ext/callbacks/langfuse/v2"
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
@@ -18,6 +19,12 @@ import (
 	"strings"
 	"time"
 )
+
+const defaultServicePrompt = `你是 {{service_name}} 的办事助手。
+查询办理进度时使用 query_progress。
+查询活动时使用 query_activities。
+缺少编号或活动关键字时先询问用户。
+未找到时如实说明，普通闲聊直接回答，不编造查询结果。`
 
 func main() {
 	langfuseConfig := langfuse.Config{
@@ -56,24 +63,49 @@ func main() {
 		log.Printf("活动工具初始化失败：%v", err)
 		return
 	}
+	client, err := langfuseclient.NewClient(os.Getenv("LANGFUSE_BASE_URL"), os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY"))
+	if err != nil {
+		fmt.Printf("创建langfuse client 失败: %v", err)
+		return
+	}
 
-	managedPrompt, compiledinstruction, err := initPrompt(ctx)
+	promptCache, err := langfuseclient.NewPromptCache(client, 3*time.Second, 30*time.Second)
+	if err != nil {
+		fmt.Printf("获取缓存提示词失败:%v", err)
+		return
+	}
+
+	promptResult, compiledinstruction, err := initPrompt(ctx, promptCache)
 	if err != nil {
 		log.Printf("准备 Prompt 失败: %v", err)
 		return
 	}
-
-	log.Printf("本次使用 Prompt：%s，版本：%d",
-		managedPrompt.Name, managedPrompt.Version)
-
-	promptHandler, err := observability.NewPromptHandler(
-		langfuseHandler,
-		managedPrompt.Name,
-		managedPrompt.Version,
+	log.Printf(
+		"本次 Prompt：来源=%s，名称=%s，版本=%d",
+		promptResult.Source,
+		promptResult.Prompt.Name,
+		promptResult.Prompt.Version,
 	)
-	if err != nil {
-		log.Printf("Prompt 追踪配置失败: %v", err)
-		return
+
+	if promptResult.RefreshError != nil {
+		log.Printf("Prompt 获取降级：%v", promptResult.RefreshError)
+	}
+	// 所有来源都保留基础追踪。
+	var selectedHandler callbacks.Handler = langfuseHandler
+
+	// 远端、新鲜缓存、旧缓存都有真实远程版本。
+	if promptResult.Source != "fallback" {
+		promptHandler, err := observability.NewPromptHandler(
+			langfuseHandler,
+			promptResult.Prompt.Name,
+			promptResult.Prompt.Version,
+		)
+		if err != nil {
+			log.Printf("Prompt 追踪配置失败：%v", err)
+			return
+		}
+
+		selectedHandler = promptHandler
 	}
 
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
@@ -130,7 +162,7 @@ func main() {
 
 	iter := runner.Run(traceCtx, []*schema.Message{
 		schema.UserMessage(question),
-	}, adk.WithCallbacks(promptHandler))
+	}, adk.WithCallbacks(selectedHandler))
 
 	finalAnswer := ""
 	for {
@@ -175,35 +207,29 @@ func main() {
 
 }
 
-func initPrompt(parentCtx context.Context) (
-	*langfuseclient.TextPrompt,
+func initPrompt(parentCtx context.Context, cache *langfuseclient.PromptCache) (
+	*langfuseclient.PromptResult,
 	string,
 	error,
 ) {
-	client, err := langfuseclient.NewClient(os.Getenv("LANGFUSE_BASE_URL"), os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY"))
-	if err != nil {
-		return nil, "", fmt.Errorf("langfuse客户端初始化失败: %w", err)
-	}
 	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 	defer cancel()
 
-	prompt, err := client.GetTextPrompt(
-		ctx, "service-assistant", "production",
-	)
+	result, err := cache.GetTextPromptWithFallback(ctx, "service-assistant", "production", defaultServicePrompt)
 	if err != nil {
 		return nil, "", fmt.Errorf("提示词获取失败：%w", err)
 	}
-	standardPrompt, err := langfuseclient.CompileText(prompt.Prompt, map[string]string{
+	standardPrompt, err := langfuseclient.CompileText(result.Prompt.Prompt, map[string]string{
 		"service_name": "政务服务中心",
 	})
 	if err != nil {
-		return prompt, "", fmt.Errorf("提示词编译失败：%w", err)
+		return result, "", fmt.Errorf("提示词编译失败：%w", err)
 	}
 	if strings.TrimSpace(standardPrompt) == "" {
 		return nil, "", fmt.Errorf("提示词不能为空")
 	}
 	fmt.Println(standardPrompt)
 
-	return prompt, standardPrompt, nil
+	return result, standardPrompt, nil
 
 }
