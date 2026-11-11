@@ -10,6 +10,7 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 	"go-langfuse-demo/internal/langfuseclient"
+	"go-langfuse-demo/internal/observability"
 	"go-langfuse-demo/internal/tools"
 	"go.opentelemetry.io/otel/trace"
 	"log"
@@ -65,6 +66,16 @@ func main() {
 	log.Printf("本次使用 Prompt：%s，版本：%d",
 		managedPrompt.Name, managedPrompt.Version)
 
+	promptHandler, err := observability.NewPromptHandler(
+		langfuseHandler,
+		managedPrompt.Name,
+		managedPrompt.Version,
+	)
+	if err != nil {
+		log.Printf("Prompt 追踪配置失败: %v", err)
+		return
+	}
+
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		Model:   "deepseek-flash",
 		APIKey:  os.Getenv("DS_API_KEY"),
@@ -119,7 +130,7 @@ func main() {
 
 	iter := runner.Run(traceCtx, []*schema.Message{
 		schema.UserMessage(question),
-	}, adk.WithCallbacks(langfuseHandler))
+	}, adk.WithCallbacks(promptHandler))
 
 	finalAnswer := ""
 	for {
@@ -189,7 +200,7 @@ func initPrompt(parentCtx context.Context) (
 		return prompt, "", fmt.Errorf("提示词编译失败：%w", err)
 	}
 	if strings.TrimSpace(standardPrompt) == "" {
-		return prompt, "", fmt.Errorf("提示词不能为空,%w", err)
+		return nil, "", fmt.Errorf("提示词不能为空")
 	}
 	fmt.Println(standardPrompt)
 

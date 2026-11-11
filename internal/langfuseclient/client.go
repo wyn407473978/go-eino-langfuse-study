@@ -94,7 +94,9 @@ func (c *Client) GetTextPrompt(ctx context.Context, name, label string) (*TextPr
 	}()
 	responseCode := response.StatusCode
 	if responseCode != http.StatusOK {
-		return nil, fmt.Errorf("http response error:%v", responseCode)
+		return nil, &HTTPStatusError{
+			StatusCode: responseCode,
+		}
 	}
 	if err := json.NewDecoder(response.Body).Decode(textPrompt); err != nil {
 		return nil, fmt.Errorf("解码 Prompt 响应失败: %w", err)
