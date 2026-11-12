@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -70,7 +71,7 @@ func main() {
 		return
 	}
 
-	promptCache, err := langfuseclient.NewPromptCache(client, 3*time.Second, 30*time.Second)
+	promptCache, err := langfuseclient.NewPromptCache(client, 30*time.Second, 30*time.Second)
 	if err != nil {
 		fmt.Printf("获取缓存提示词失败:%v", err)
 		return
@@ -87,15 +88,40 @@ func main() {
 		return
 	}
 
-	if err := runAgentOnce(
-		ctx,
-		chatModel,
-		langfuseHandler,
-		promptCache,
-		[]tool.BaseTool{progressTool, activitiesTool},
-		"有没有 Go 相关活动？",
-	); err != nil {
-		log.Printf("本次问答失败：%v", err)
+	toolList := []tool.BaseTool{progressTool, activitiesTool}
+	scanner := bufio.NewScanner(os.Stdin)
+
+	fmt.Println("请输入问题，输入 exit 退出。")
+
+	for {
+		fmt.Print("\n你：")
+
+		if !scanner.Scan() {
+			break
+		}
+
+		question := strings.TrimSpace(scanner.Text())
+		if question == "" {
+			continue
+		}
+		if strings.EqualFold(question, "exit") {
+			break
+		}
+
+		if err := runAgentOnce(
+			ctx,
+			chatModel,
+			langfuseHandler,
+			promptCache,
+			toolList,
+			question,
+		); err != nil {
+			log.Printf("本次问答失败：%v", err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("读取终端输入失败：%v", err)
 	}
 
 }
