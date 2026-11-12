@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/cloudwego/eino-ext/callbacks/langfuse/v2"
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -35,7 +36,7 @@ func main() {
 		ServiceName:                "go-langfuse-agent",
 		CollapseAgentInternalSpans: true,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	langfuseHandler, err := langfuse.NewHandler(ctx, &langfuseConfig)
 	if err != nil {
@@ -75,39 +76,6 @@ func main() {
 		return
 	}
 
-	promptResult, compiledinstruction, err := initPrompt(ctx, promptCache)
-	if err != nil {
-		log.Printf("准备 Prompt 失败: %v", err)
-		return
-	}
-	log.Printf(
-		"本次 Prompt：来源=%s，名称=%s，版本=%d",
-		promptResult.Source,
-		promptResult.Prompt.Name,
-		promptResult.Prompt.Version,
-	)
-
-	if promptResult.RefreshError != nil {
-		log.Printf("Prompt 获取降级：%v", promptResult.RefreshError)
-	}
-	// 所有来源都保留基础追踪。
-	var selectedHandler callbacks.Handler = langfuseHandler
-
-	// 远端、新鲜缓存、旧缓存都有真实远程版本。
-	if promptResult.Source != "fallback" {
-		promptHandler, err := observability.NewPromptHandler(
-			langfuseHandler,
-			promptResult.Prompt.Name,
-			promptResult.Prompt.Version,
-		)
-		if err != nil {
-			log.Printf("Prompt 追踪配置失败：%v", err)
-			return
-		}
-
-		selectedHandler = promptHandler
-	}
-
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		Model:   "deepseek-flash",
 		APIKey:  os.Getenv("DS_API_KEY"),
@@ -119,91 +87,16 @@ func main() {
 		return
 	}
 
-	//- 办事进度使用 query_progress。
-	//- 活动查询使用 query_activities。
-	//- 缺少必要参数时询问用户。
-	//- 未找到时如实说明，闲聊直接回答。
-	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:          "service_assistant",
-		Description:   "提供办事进度查询的助手",
-		Instruction:   compiledinstruction,
-		Model:         chatModel,
-		MaxIterations: 5,
-		ToolsConfig: adk.ToolsConfig{
-			ToolsNodeConfig: compose.ToolsNodeConfig{
-				Tools: []tool.BaseTool{progressTool, activitiesTool},
-			},
-		},
-	})
-	if err != nil {
-		log.Printf("Agent 创建失败: %v", err)
-		return
+	if err := runAgentOnce(
+		ctx,
+		chatModel,
+		langfuseHandler,
+		promptCache,
+		[]tool.BaseTool{progressTool, activitiesTool},
+		"有没有 Go 相关活动？",
+	); err != nil {
+		log.Printf("本次问答失败：%v", err)
 	}
-
-	question := "有没有 Go 相关活动？"
-
-	traceCtx := langfuseHandler.StartTrace(ctx,
-		langfuse.WithName("agent-demo"),
-		langfuse.WithInput(question),
-		langfuse.WithTags("agent", "lesson-d15"),
-	)
-
-	traceOutput := "Agent 未完成"
-	defer func() {
-		langfuseHandler.EndTrace(traceCtx, traceOutput)
-	}()
-	log.Printf("trace_id=%s",
-		trace.SpanFromContext(traceCtx).SpanContext().TraceID().String())
-
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{
-		Agent:           agent,
-		EnableStreaming: false,
-	})
-
-	iter := runner.Run(traceCtx, []*schema.Message{
-		schema.UserMessage(question),
-	}, adk.WithCallbacks(selectedHandler))
-
-	finalAnswer := ""
-	for {
-		event, ok := iter.Next()
-		if !ok {
-			break // 正常结束，不代表读取失败
-		}
-		if event.Err != nil {
-			log.Printf("Agent 执行失败: %v", event.Err)
-			return
-		}
-		if event.Output == nil || event.Output.MessageOutput == nil {
-			continue
-		}
-
-		output := event.Output.MessageOutput
-		msg, err := output.GetMessage()
-		if err != nil {
-			log.Printf("读取消息失败: %v", err)
-			return
-		}
-		if msg == nil {
-			continue
-		}
-		if msg.Role == schema.Assistant && len(msg.ToolCalls) == 0 {
-			finalAnswer = msg.Content
-		}
-
-		fmt.Printf("角色：%s，工具：%s\n", msg.Role, output.ToolName)
-		fmt.Printf("正文：%s\n工具调用：%+v\n", msg.Content, msg.ToolCalls)
-	}
-	if err := ctx.Err(); err != nil {
-		log.Printf("Agent 请求未完成: %v", err)
-		return
-	}
-	if finalAnswer == "" {
-		log.Println("Agent 未返回最终正文")
-		return
-	}
-
-	traceOutput = finalAnswer
 
 }
 
@@ -232,4 +125,135 @@ func initPrompt(parentCtx context.Context, cache *langfuseclient.PromptCache) (
 
 	return result, standardPrompt, nil
 
+}
+
+func runAgentOnce(
+	parentCtx context.Context,
+	chatModel *openai.ChatModel,
+	handler *langfuse.CallbackHandler,
+	cache *langfuseclient.PromptCache,
+	toolList []tool.BaseTool,
+	question string,
+) error {
+	ctx, cancel := context.WithTimeout(parentCtx, 60*time.Second)
+	defer cancel()
+
+	// 移入：获取 Prompt、打印来源及降级原因。
+	promptResult, compiledinstruction, err := initPrompt(ctx, cache)
+	if err != nil {
+		return err
+	}
+	log.Printf(
+		"本次 Prompt：来源=%s，名称=%s，版本=%d",
+		promptResult.Source,
+		promptResult.Prompt.Name,
+		promptResult.Prompt.Version,
+	)
+
+	if promptResult.RefreshError != nil {
+		log.Printf("Prompt 获取降级：%v", promptResult.RefreshError)
+	}
+	// 移入：根据来源选择 selectedHandler。
+	// 所有来源都保留基础追踪。
+	var selectedHandler callbacks.Handler = handler
+
+	// 远端、新鲜缓存、旧缓存都有真实远程版本。
+	if promptResult.Source != "fallback" {
+		promptHandler, err := observability.NewPromptHandler(
+			handler,
+			promptResult.Prompt.Name,
+			promptResult.Prompt.Version,
+		)
+		if err != nil {
+			return fmt.Errorf("Prompt 追踪配置失败：%w", err)
+		}
+
+		selectedHandler = promptHandler
+	}
+
+	// 移入：创建 Agent，使用本轮 compiledinstruction。
+
+	//- 办事进度使用 query_progress。
+	//- 活动查询使用 query_activities。
+	//- 缺少必要参数时询问用户。
+	//- 未找到时如实说明，闲聊直接回答。
+	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:          "service_assistant",
+		Description:   "提供办事进度查询的助手",
+		Instruction:   compiledinstruction,
+		Model:         chatModel,
+		MaxIterations: 5,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: toolList,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("Agent 创建失败: %w", err)
+	}
+
+	// 移入：创建根 trace、Runner，消费事件并收集最终回答。
+
+	traceCtx := handler.StartTrace(ctx,
+		langfuse.WithName("agent-demo"),
+		langfuse.WithInput(question),
+		langfuse.WithTags("agent", "lesson-d15"),
+	)
+
+	traceOutput := "Agent 未完成"
+	defer func() {
+		handler.EndTrace(traceCtx, traceOutput)
+	}()
+	log.Printf("trace_id=%s",
+		trace.SpanFromContext(traceCtx).SpanContext().TraceID().String())
+
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{
+		Agent:           agent,
+		EnableStreaming: false,
+	})
+
+	iter := runner.Run(traceCtx, []*schema.Message{
+		schema.UserMessage(question),
+	}, adk.WithCallbacks(selectedHandler))
+
+	finalAnswer := ""
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break // 正常结束，不代表读取失败
+		}
+		if event.Err != nil {
+			return fmt.Errorf("Agent 执行失败：%w", event.Err)
+		}
+		if event.Output == nil || event.Output.MessageOutput == nil {
+			continue
+		}
+
+		output := event.Output.MessageOutput
+		msg, err := output.GetMessage()
+		if err != nil {
+			return fmt.Errorf("读取消息失败：%w", err)
+		}
+		if msg == nil {
+			continue
+		}
+		if msg.Role == schema.Assistant && len(msg.ToolCalls) == 0 {
+			finalAnswer = msg.Content
+		}
+
+		fmt.Printf("角色：%s，工具：%s\n", msg.Role, output.ToolName)
+		fmt.Printf("正文：%s\n工具调用：%+v\n", msg.Content, msg.ToolCalls)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("Agent 请求未完成: %w", err)
+	}
+	if finalAnswer == "" {
+		log.Println("Agent 未返回最终正文")
+		return errors.New("Agent 未返回最终正文")
+	}
+
+	traceOutput = finalAnswer
+
+	return nil
 }
